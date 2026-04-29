@@ -1,502 +1,258 @@
 ---
 title: "KRIES: Kernel Runtime Integrity Enforcement System"
-author: Your Name
-date: April 27, 2026
-documentclass: apa7
-classoption: man
+author: "3star333"
+date: "April 28, 2026"
+geometry: margin=1in
+fontsize: 12pt
+linestretch: 2
 header-includes:
+  - \usepackage{times}
   - \usepackage{setspace}
-  - \doublespacing
 ---
 
-## Abstract
+# Abstract
 
-KRIES (Kernel Runtime Integrity Enforcement System) is a loadable Linux kernel module (LKM) designed to monitor, detect, and report anomalous runtime behavior from within the kernel itself. The system targets three primary threat surfaces: unauthorized process debugging via `ptrace`, suspicious kernel module activity, and abnormal process lifecycle events. KRIES exposes its findings to user space through the `/proc` virtual filesystem, enabling lightweight integration with existing monitoring pipelines. This paper describes the design rationale, implementation strategy, kernel APIs used, and the security trade-offs involved in building a host-based integrity monitor at the kernel level.
-
----
-
-## Introduction
-
-Modern operating systems face a persistent challenge: software running in user space cannot fully trust the environment it operates in. Rootkits, memory-resident malware, and debugging-based exploits operate below the visibility horizon of user-space security tools. Traditional antivirus and endpoint detection software suffers from a fundamental limitation — it is itself a user-space process, subject to manipulation by the very threats it tries to detect.
-
-Kernel-level monitoring addresses this gap. By operating at ring 0 (the highest CPU privilege level), a kernel module can observe system state that is invisible or falsifiable from user space. It can walk the real process table, inspect `task_struct` flags directly, enumerate loaded modules from the kernel's own linked list, and react to events before they are mediated by any user-space layer.
-
-KRIES is built on this principle. It is not a replacement for a full security framework (such as SELinux or AppArmor), but rather an instructional and functional demonstration of how kernel-level runtime integrity monitoring works. The project is structured in progressive phases, each introducing a new monitoring capability while keeping the code readable and auditable.
-
-### Goals
-
-- Demonstrate the structure and lifecycle of a Linux loadable kernel module.
-- Implement non-invasive monitoring of process and module state.
-- Detect common indicators of compromise (ptrace-based debugging, unexpected modules).
-- Expose system state to user space via the `/proc` interface.
-- Serve as a reference implementation for kernel security concepts.
-
-### Non-Goals
-
-- KRIES does not enforce policy (it does not block processes or kill threads).
-- KRIES does not use kernel function hooking (kprobes, ftrace trampolines) in its base implementation.
-- KRIES is not intended for production deployment without further hardening.
+KRIES (Kernel Runtime Integrity Enforcement System) is a loadable Linux kernel module (LKM) that performs runtime integrity monitoring from within the kernel itself. The system enumerates all running processes, detects unauthorized debugging via inspection of the `ptrace` flag in each process's `task_struct`, and exposes a live integrity report through the `/proc` virtual filesystem. Implemented in C and targeting Ubuntu Linux kernel 6.8, KRIES demonstrates that meaningful host-based security monitoring is achievable using stable, well-documented kernel APIs without invasive hooking or policy enforcement. This paper describes the system design, kernel mechanisms used, implementation decisions, and the inherent limitations of same-privilege monitoring.
 
 ---
 
-## Background & Prior Work
+# 1. Introduction
 
-### Loadable Kernel Modules (LKMs)
+User-space security tools share a fundamental weakness: they are processes. An attacker operating at kernel privilege can manipulate or hide from any monitor that runs above them. Antivirus software, host-based intrusion detection systems, and endpoint agents are all subject to this constraint. When a threat operates at ring 0, the only reliable vantage point for detection is ring 0 itself.
 
-Linux supports dynamic extension of the kernel through loadable modules. A module is an ELF object file (`.ko`) that is linked into the running kernel image at load time. Modules share the kernel's address space and execute at ring 0. They are used to implement device drivers, filesystems, network protocols, and security subsystems.
+Linux loadable kernel modules (LKMs) provide a mechanism for extending the kernel at runtime without recompilation or reboot. A security module loaded as an LKM executes at the same privilege level as the kernel, shares the kernel's address space, and can read data structures — such as the process table and debugging state — that user-space tools can only observe through mediated interfaces.
 
-The module lifecycle is:
+KRIES exploits this position to implement two core monitoring capabilities:
 
-```
-Compilation → insmod (load) → [running in kernel] → rmmod (unload)
-```
+1. **Process enumeration** — reading the kernel's internal process list directly, bypassing any user-space mediation.
+2. **Ptrace detection** — inspecting the `PT_PTRACED` flag in each process's `task_struct` to identify processes currently under debugger control.
 
-Modules are managed by `module_init()` and `module_exit()` callbacks, registered at compile time via macros. The kernel verifies module compatibility via a version magic string embedded in the `.ko` file.
+The findings are surfaced via `/proc/kries`, a virtual file that any user-space tool can read with a simple `cat` command.
 
-### The Linux Process Model
+## 1.1 Goals
 
-Every process in Linux is represented by a `task_struct` — a large kernel data structure containing all information about a running process: its PID, state, credentials, memory maps, file descriptors, and scheduling information. All `task_struct` instances are linked together in a doubly-linked circular list, iterable via the `for_each_process()` macro.
+- Implement a working LKM that loads and unloads cleanly on kernel 6.8.
+- Enumerate all running processes using kernel-internal data structures.
+- Detect active `ptrace` attachment on any process.
+- Expose results to user space through the `/proc` filesystem.
+- Emit structured, parseable alert messages to the kernel log.
 
-### ptrace and Debugging Detection
+## 1.2 Non-Goals
 
-`ptrace` is the Linux system call that underlies all user-space debuggers (GDB, strace, ltrace). When a process is being traced, its `task_struct` has the `PT_PTRACED` flag set in the `.ptrace` field. Inspecting this field from kernel space provides a reliable, tamper-resistant method of detecting active debugging.
-
-From user space, a process can call `ptrace(PTRACE_TRACEME, ...)` to voluntarily allow itself to be traced, or a debugger can attach to a target via `ptrace(PTRACE_ATTACH, ...)`. In both cases, the kernel sets the flag on the target's `task_struct`.
-
-Anti-debugging techniques frequently use ptrace as either a detection vector or an attack surface. Malware may call `ptrace(PTRACE_TRACEME)` on itself to prevent a second debugger from attaching, or it may attempt to detect and terminate itself if a debugger is found.
-
-### The /proc Virtual Filesystem
-
-`/proc` is a pseudo-filesystem that exists only in memory. It is the standard Linux mechanism for exposing kernel state to user space. Each entry under `/proc` is backed by a kernel data structure with registered read (and optionally write) callbacks. When a user runs `cat /proc/kries`, the kernel calls the registered read function and streams the output to the user's terminal.
-
-### Related Systems
-
-| System | Approach | Scope |
-|---|---|---|
-| **SELinux** | Mandatory Access Control via LSM hooks | Policy enforcement |
-| **AppArmor** | Profile-based MAC | Application confinement |
-| **Auditd** | Syscall auditing via the audit subsystem | Event logging |
-| **LKRG (Linux Kernel Runtime Guard)** | Integrity checking of kernel data structures | Kernel self-protection |
-| **Sysdig / Falco** | eBPF-based syscall monitoring | Runtime threat detection |
-| **KRIES** | LKM-based state inspection and detection | Monitoring and alerting |
-
-KRIES occupies a simpler, more transparent niche than production systems like LKRG or Falco. It is designed to be readable and instructional while still performing real detection work.
+- KRIES does not enforce policy. It does not kill, suspend, or modify any process.
+- KRIES does not use kernel function hooking (kprobes, ftrace) or the Linux Security Module (LSM) framework.
+- KRIES is a monitoring and demonstration tool, not a production security product.
 
 ---
 
-## Threat Model
+# 2. Background
 
-KRIES is designed to detect the following classes of threats:
+## 2.1 Loadable Kernel Modules
 
-### 1. Unauthorized Process Debugging
+The Linux kernel supports runtime extension through loadable kernel modules — ELF object files compiled against the running kernel's headers and linked into the kernel image at load time via `insmod`. Modules share the kernel's virtual address space and execute at CPU ring 0, the highest privilege level. They are removed cleanly via `rmmod`, which calls the module's registered exit function before freeing its memory.
 
-**Actor:** An attacker or malicious process using `ptrace` to inspect or manipulate another process's memory or execution.
+Every module must declare two callbacks:
 
-**Indicator:** `task_struct.ptrace` field has `PT_PTRACED` set for a process that should not be under debugger control.
+- `module_init(fn)` — called when the module loads.
+- `module_exit(fn)` — called when the module is removed.
 
-**Risk:** Code injection, credential theft, anti-tamper bypass, exploit development.
+The `MODULE_LICENSE("GPL")` declaration is required for any module that accesses GPL-only exported kernel symbols. Without it, the kernel refuses to resolve those symbols at load time.
 
-### 2. Suspicious Kernel Module Loading
+## 2.2 The task_struct and Process Table
 
-**Actor:** A rootkit or privileged malware loading a kernel module to hide itself or intercept system calls.
+Every process and thread in Linux is represented by a `task_struct` — a large kernel data structure defined in `<linux/sched.h>`. It contains the process's PID, name (`comm`, a 16-byte array), credentials, memory descriptor, scheduling state, and debugging flags. All `task_struct` instances are linked in a circular doubly-linked list traversable via the `for_each_process()` macro, which visits one thread-group leader per process.
 
-**Indicator:** A module appears in the kernel module list with an unrecognized name, or a module is loaded from an unexpected path.
+The process list is protected by RCU (Read-Copy-Update). Readers must acquire an RCU read-side lock (`rcu_read_lock()`) for the duration of any traversal. This lock is extremely lightweight — it disables preemption on the current CPU rather than acquiring a traditional mutex — but it prohibits sleeping or blocking within the critical section.
 
-**Risk:** System call table hooking, process hiding, network traffic interception.
+## 2.3 ptrace and the PT_PTRACED Flag
 
-### 3. Abnormal Process State
+`ptrace(2)` is the Linux system call underlying all user-space debuggers including GDB and strace. When a tracer attaches to a target process, the kernel sets the `PT_PTRACED` bit (value `0x1`) in the target's `task_struct.ptrace` field via `__ptrace_link()`. This flag is cleared by `__ptrace_unlink()` when the tracer detaches.
 
-**Actor:** A process in an unexpected lifecycle state (zombie, stopped) that persists longer than expected.
+Because `task_struct` resides in kernel memory, the `ptrace` field cannot be read, modified, or cleared by any user-space process. Reading it from kernel space therefore provides a tamper-resistant detection signal: if `PT_PTRACED` is set, a tracer is attached.
 
-**Indicator:** Processes with unusual flags or parent-child relationships visible in `task_struct` iteration.
+## 2.4 The /proc Virtual Filesystem
 
-**Risk:** Process injection staging, resource exhaustion, covert persistence.
-
-### Out of Scope
-
-- Network-based threats
-- Filesystem integrity (handled better by IMA/EVM)
-- Hardware-level attacks
-- Kernel exploits that compromise KRIES itself
+`/proc` is a memory-only virtual filesystem that exposes kernel state to user space. Each entry under `/proc` is backed by kernel callbacks rather than disk data. The `seq_file` API, introduced in kernel 3.10, provides a safe and memory-efficient mechanism for implementing readable `/proc` files. It handles buffer allocation, pagination, and re-reading automatically. The `proc_ops` structure (replacing `file_operations` for `/proc` files as of kernel 5.6) registers the open, read, seek, and release callbacks for a given entry.
 
 ---
 
-## System Architecture
+# 3. System Architecture
 
-instert photo here
+KRIES is composed of four source modules with clearly separated responsibilities:
 
-### Component Responsibilities
-
-| Component | Responsibility |
+| File | Responsibility |
 |---|---|
-| **Logging Infrastructure** | Unified `printk` wrappers with consistent formatting |
-| **Process Monitor** | Iterates `task_struct` list; extracts PID, name, parent, flags |
-| **Module Monitor** | Iterates kernel module linked list; logs names and states |
-| **Detection Engine** | Applies rules to monitor output; generates structured alerts |
-| **/proc Interface** | Exposes detection results and system state to user space |
+| `kries_main.c` | Module entry and exit; orchestrates subsystem initialisation |
+| `kries_process.c` | Process enumeration; `kries_is_traced()` detection primitive |
+| `kries_detect.c` | Detection engine; applies rules, emits structured alerts |
+| `kries_proc.c` | `/proc/kries` interface; live report for user-space readers |
+| `kries_log.h` | Unified `printk` wrappers: `KRIES_INFO`, `KRIES_WARN`, `KRIES_ALERT` |
 
----
-
-## Module Design (Phase Breakdown)
-
-### Phase 1 — Minimal Kernel Module
-
-#### Purpose
-
-Establish the scaffolding for all subsequent phases. Verify that the build environment is correctly configured and that the module can be loaded and unloaded cleanly.
-
-#### Key Kernel APIs
-
-| API | Header | Description |
-|---|---|---|
-| `module_init(fn)` | `<linux/module.h>` | Register the init function |
-| `module_exit(fn)` | `<linux/module.h>` | Register the exit function |
-| `printk(level, fmt, ...)` | `<linux/kernel.h>` | Write to kernel ring buffer |
-| `MODULE_LICENSE("GPL")` | `<linux/module.h>` | Declare license (required for GPL symbols) |
-
-#### Design Notes
-
-The `__init` and `__exit` annotations on the init/exit functions are compiler hints. `__init` marks code that can be freed from memory after initialization completes. `__exit` marks code that is only needed during unload. Both annotations reduce the module's runtime memory footprint.
-
-The `MODULE_LICENSE("GPL")` declaration is mandatory for any module that uses GPL-only exported kernel symbols. Without it, the kernel will refuse to resolve those symbols and `insmod` will fail with an "Unknown symbol" error. It also taints the kernel if omitted, which affects crash dump analysis.
-
-#### Build System
-
-KRIES uses the kernel's `kbuild` system. The `Makefile` delegates compilation to the kernel's own build infrastructure at `/lib/modules/$(uname -r)/build`. This ensures the module is compiled with the exact same flags, headers, and ABI as the running kernel — a requirement for successful loading.
+The execution flow on module load is linear:
 
 ```
-obj-m += kries.o
-KDIR  := /lib/modules/$(shell uname -r)/build
-all:
-    $(MAKE) -C $(KDIR) M=$(PWD) modules
+insmod kries.ko
+    └── kries_init()
+            ├── kries_scan_processes()   // enumerate + log all processes
+            ├── kries_run_scan()         // apply detection rules, emit alerts
+            └── kries_proc_init()        // register /proc/kries
 ```
 
----
+On unload:
 
-### Phase 2 — Logging Infrastructure
+```
+rmmod kries
+    └── kries_exit()
+            ├── kries_proc_exit()        // remove /proc/kries FIRST
+            └── log unload message
+```
 
-#### Purpose
+The `/proc` entry must be removed before the module is freed. Failing to do so leaves a function pointer registered in the proc tree that points to freed memory; the next `cat /proc/kries` would cause a kernel panic.
 
-Replace raw `printk()` calls with structured, consistent logging macros. All KRIES output must be identifiable in `dmesg` output by a consistent prefix.
+## 3.1 Logging Infrastructure
 
-#### Design
-
-Three log levels are defined, each mapping to a `printk` severity level:
-
-| Macro | printk Level | Use Case |
-|---|---|---|
-| `KRIES_INFO(fmt, ...)` | `KERN_INFO` | Normal operational messages |
-| `KRIES_WARN(fmt, ...)` | `KERN_WARNING` | Suspicious but non-critical events |
-| `KRIES_ALERT(fmt, ...)` | `KERN_ALERT` | High-severity detections |
-
-All macros prepend `[KRIES]` to the message and append `\n` automatically, ensuring consistent formatting regardless of the calling site.
-
-#### Design Notes
-
-Using macros rather than wrapper functions keeps logging zero-overhead in release builds (the compiler inlines them). The `##__VA_ARGS__` pattern handles the case where no variadic arguments are passed, avoiding a trailing-comma compile error in C99.
-
-The `KERN_ALERT` level is intentionally distinct from `KERN_CRIT` and `KERN_EMERG` — those levels are reserved for kernel self-protection failures. `KERN_ALERT` is the appropriate level for "action must be taken immediately" security events that are serious but do not indicate kernel corruption.
-
----
-
-### Phase 3 — Process Monitoring
-
-#### Purpose
-
-Enumerate all running processes using kernel-internal data structures and log their identity and relationships.
-
-#### Key Kernel APIs
-
-| API | Header | Description |
-|---|---|---|
-| `for_each_process(task)` | `<linux/sched/signal.h>` | Iterate over all `task_struct` entries |
-| `task->pid` | `<linux/sched.h>` | Process ID |
-| `task->comm` | `<linux/sched.h>` | Process name (up to 16 chars) |
-| `task->parent->pid` | `<linux/sched.h>` | Parent process ID |
-| `rcu_read_lock()` | `<linux/rcupdate.h>` | Acquire RCU read lock |
-| `rcu_read_unlock()` | `<linux/rcupdate.h>` | Release RCU read lock |
-
-#### Design Notes
-
-**RCU (Read-Copy-Update)** is the kernel's primary mechanism for protecting shared data structures that are read far more often than they are written. The process list is protected by RCU. Any iteration over it must be wrapped in an RCU read-side critical section (`rcu_read_lock()` / `rcu_read_unlock()`). Failing to do so can result in use-after-free bugs if a process exits during iteration.
-
-`task->comm` is a 16-byte character array (`TASK_COMM_LEN`). It stores a truncated version of the process's executable name. It is not the same as the full command line (which lives in user-space memory and requires `copy_from_user()` to access safely).
-
-The `for_each_process()` macro only iterates over thread group leaders (one entry per process). To iterate over all threads within a process, `for_each_thread()` would be used instead.
-
----
-
-### Phase 4 — Debug Detection
-
-#### Purpose
-
-Identify processes that are currently under debugger control by inspecting `ptrace`-related flags in `task_struct`.
-
-#### Detection Mechanism
+All KRIES output passes through three macros defined in `kries_log.h`:
 
 ```c
-/* In task_struct, the .ptrace field holds bitflags. */
-/* PT_PTRACED is set when a process has an active tracer attached. */
+KRIES_INFO(fmt, ...)   // KERN_INFO    — [KRIES]
+KRIES_WARN(fmt, ...)   // KERN_WARNING — [KRIES][WARN]
+KRIES_ALERT(fmt, ...)  // KERN_ALERT   — [KRIES][ALERT]
+```
 
-if (task->ptrace & PT_PTRACED) {
-    /* This process is being traced (debugged). */
+The `[KRIES]` prefix on every line makes all output trivially grep-able in `dmesg`. Alert lines use `key=value` format so they are parseable by log aggregation tools without post-processing.
+
+---
+
+# 4. Implementation
+
+## 4.1 Process Enumeration
+
+`kries_scan_processes()` in `kries_process.c` iterates over the kernel process list:
+
+```c
+rcu_read_lock();
+for_each_process(task) {
+    KRIES_INFO("pid=%-6d  name=%-16s  ppid=%d",
+               task->pid, task->comm, task->parent->pid);
+}
+rcu_read_unlock();
+```
+
+`for_each_process()` is a macro that walks the circular `task_struct` list. `task->comm` is a 16-byte null-terminated character array holding the truncated executable name. `task->parent->pid` is safe to dereference under the RCU read lock because a process's parent pointer remains valid for the lifetime of both processes.
+
+## 4.2 ptrace Detection
+
+`kries_is_traced()` implements the detection primitive:
+
+```c
+int kries_is_traced(struct task_struct *task)
+{
+    return (task->ptrace & PT_PTRACED) ? 1 : 0;
 }
 ```
 
-The `ptrace` field in `task_struct` is a bitmask. The relevant flags are:
+This single bitwise AND is the complete detection mechanism. `PT_PTRACED` is defined as `0x1` in `<linux/ptrace.h>`. Any non-zero result confirms an active tracer.
 
-| Flag | Value | Meaning |
-|---|---|---|
-| `PT_PTRACED` | `0x00000001` | Process has an active tracer |
-| `PT_SEIZED` | `0x00010000` | Tracer used `PTRACE_SEIZE` (newer attach method) |
-| `PT_STOPPED` | `0x00000004` | Process is in ptrace-stop state |
+## 4.3 Detection Engine
 
-#### Design Notes
-
-This detection method is reliable when KRIES runs at a higher privilege level than the traced process (which is always true for kernel code). It cannot be bypassed from user space by simply modifying the flag — `task_struct` lives in kernel memory.
-
-However, a kernel rootkit running at the same privilege level could potentially clear these flags before KRIES reads them. This is a fundamental limitation of same-ring monitoring, addressed further in the Limitations section.
-
-**False Positives:** Any process being debugged by a legitimate debugger (GDB, strace) will be flagged. In a real deployment, a whitelist of expected traced processes (or processes traced by authorized debuggers) would be necessary. KRIES logs all detected cases and lets the operator decide.
-
----
-
-### Phase 5 — Kernel Module Monitoring
-
-#### Purpose
-
-Enumerate all currently loaded kernel modules using the kernel's internal module list.
-
-#### Key Kernel APIs
-
-| API | Header | Description |
-|---|---|---|
-| `struct module` | `<linux/module.h>` | Represents a loaded kernel module |
-| `THIS_MODULE` | `<linux/module.h>` | Pointer to the current module's `struct module` |
-| `list_for_each_entry()` | `<linux/list.h>` | Iterate over a `list_head` linked list |
-| `mutex_lock(&module_mutex)` | `<linux/mutex.h>` | Lock protecting the module list |
-
-#### Module States
-
-The `struct module` contains a `state` field of type `enum module_state`:
-
-| State | Value | Meaning |
-|---|---|---|
-| `MODULE_STATE_LIVE` | 0 | Module is running normally |
-| `MODULE_STATE_COMING` | 1 | Module is being loaded |
-| `MODULE_STATE_GOING` | 2 | Module is being unloaded |
-| `MODULE_STATE_UNFORMED` | 3 | Module is being initialized |
-
-#### Design Notes
-
-The kernel's module list is a standard doubly-linked list (`list_head`) rooted at an internal symbol. Traversal requires holding `module_mutex` to prevent concurrent modifications (module load/unload from another context).
-
-`struct module` contains the module's name in the `.name` field — a fixed-length character array. The module list includes KRIES itself, which should be expected and can be filtered from output.
-
-A rootkit commonly attempts to remove its own `struct module` from this list to become invisible to `lsmod`. KRIES would then not see it either — which is why this monitoring technique is most useful for detecting accidental or semi-covert loads, not fully-committed rootkits. LKRG and similar tools use memory integrity checks to detect such list tampering.
-
----
-
-### Phase 6 — /proc Interface
-
-#### Purpose
-
-Create a readable file at `/proc/kries` that streams KRIES status information to any user-space process that opens it.
-
-#### Key Kernel APIs
-
-| API | Header | Description |
-|---|---|---|
-| `proc_create()` | `<linux/proc_fs.h>` | Create a /proc entry |
-| `proc_remove()` | `<linux/proc_fs.h>` | Remove a /proc entry |
-| `seq_file` interface | `<linux/seq_file.h>` | Safe sequential output for /proc files |
-| `seq_printf()` | `<linux/seq_file.h>` | printf-like output to seq_file buffer |
-| `single_open()` | `<linux/seq_file.h>` | Simplified seq_file open for single-pass output |
-
-#### Design Notes
-
-Early Linux `/proc` files used a raw `read_proc` callback that required careful buffer management. The modern approach uses the `seq_file` interface, which handles buffer allocation, pagination, and re-reading automatically. It is the correct API for any `/proc` file that outputs more than a trivial amount of data.
-
-The `/proc` file created by KRIES is **read-only** (`0444` permissions). Write support (for runtime configuration) could be added via a `write` callback in the `file_operations` struct, but is deferred to future work.
-
-**Cleanup:** The `/proc` entry must be explicitly removed in `kries_exit()` via `proc_remove()`. Failing to do so leaves a dangling pointer in the proc tree — accessing `/proc/kries` after the module unloads would cause a kernel panic (null dereference into freed module memory).
-
----
-
-### Phase 7 — Detection Engine
-
-#### Purpose
-
-Combine process and module monitoring into a rule-based detection system that generates structured alerts.
-
-#### Rule Architecture
-
-Each detection rule is a boolean function with a consistent signature:
+`kries_run_scan()` in `kries_detect.c` drives the detection loop:
 
 ```c
-bool is_debugged(struct task_struct *task);
-bool is_suspicious_module(struct module *mod);
+rcu_read_lock();
+for_each_process(task) {
+    if (rule_ptrace(task)) {
+        KRIES_ALERT("type=PTRACE_DETECTED  pid=%-6d  name=%-16s  "
+                    "ppid=%-6d  ptrace_flags=0x%x",
+                    task->pid, task->comm,
+                    task->parent->pid, task->ptrace);
+        alerts++;
+    }
+}
+rcu_read_unlock();
 ```
 
-A central `kries_run_scan()` function iterates over all processes and modules, applying each rule and logging structured alerts when a rule fires.
+The engine is designed for extension: adding a new rule requires writing one `static int rule_*(struct task_struct *)` function and calling it inside the loop. No other files need to change.
 
-#### Alert Format
+## 4.4 /proc Interface
+
+`kries_proc_init()` registers `/proc/kries` using `proc_create()` with `0444` permissions (world-readable). The `seq_file` callback `kries_proc_show()` iterates the process list and writes a formatted table:
 
 ```
-[KRIES][ALERT] type=DEBUG_DETECTED pid=<pid> name=<comm> parent=<ppid>
-[KRIES][ALERT] type=SUSPICIOUS_MODULE name=<modname> state=<state>
+KRIES — Kernel Runtime Integrity Report
+========================================
+
+PID       NAME              PPID      FLAGS
+--------  ----------------  --------  -------
+1         systemd           0
+2         kthreadd          0
+1204      bash              1203
+2847      sleep             1201      [TRACED]
 ```
 
-Structured key=value log format is used rather than free-form text. This makes alerts parseable by log aggregation tools (Splunk, ELK, journald structured logging) without post-processing.
-
-#### Design Notes
-
-The detection engine is intentionally stateless in its initial implementation — each scan is an independent snapshot. A stateful engine (detecting changes between scans, rather than absolute state) would require persisting previous scan results and comparing deltas. This is a natural extension for Phase 8+ work.
-
-The scan is triggered on module load (and can be extended to run on a timer via `timer_list` or a kernel thread via `kthread_create()`). Running continuously in a kernel thread would require careful CPU usage management to avoid starving other kernel work.
+Processes with `PT_PTRACED` set are marked `[TRACED]`. The report is generated fresh on every `read()` call — there is no caching.
 
 ---
 
-## Kernel Concepts Reference
+# 5. Security Considerations
 
-This section provides brief explanations of key kernel concepts used throughout KRIES, for readers new to kernel development.
+## 5.1 Privilege Requirements
 
-### task_struct
+Loading KRIES requires `CAP_SYS_MODULE`. This is an appropriate gate — a module with ring-0 access to all process state must not be loadable by unprivileged users.
 
-The central data structure in the Linux process model. Every process and thread has exactly one `task_struct`. It contains:
+## 5.2 Secure Boot
 
-- **Identity:** `pid`, `tgid`, `comm` (name), `cred` (credentials)
-- **State:** `__state` (running, sleeping, stopped, zombie, etc.)
-- **Relationships:** `parent`, `children` list, `sibling` list
-- **Memory:** `mm` (memory descriptor, NULL for kernel threads)
-- **Scheduling:** priority, CPU affinity, runtime statistics
-- **Debugging:** `ptrace` flags
+On systems with UEFI Secure Boot enabled, unsigned kernel modules are rejected at load time. KRIES as built is unsigned. For deployment, the module must be signed with a Machine Owner Key (MOK) enrolled via `mokutil`, or Secure Boot must be disabled. The `sign-file` tool included with kernel headers can sign `kries.ko` with a local key.
 
-### Ring Buffer (dmesg)
+## 5.3 Read-Only Design
 
-The kernel maintains a circular buffer of log messages written via `printk()`. This buffer is accessible from user space via `dmesg` or `/dev/kmsg`. When the buffer fills, the oldest messages are overwritten. The buffer is stored in kernel memory and survives across `insmod`/`rmmod` cycles but not across reboots.
+KRIES does not write to any kernel data structure. It is a passive observer. This eliminates an entire class of potential bugs — any code that writes to shared kernel state must handle concurrent access, ordering guarantees, and rollback on error. KRIES avoids all of this by never modifying anything it reads.
 
-### RCU (Read-Copy-Update)
+## 5.4 /proc Permissions
 
-A synchronization mechanism that allows multiple readers to proceed concurrently without locking, while writers operate on a private copy and "publish" updates atomically. The process list uses RCU. Readers must call `rcu_read_lock()` before iterating and `rcu_read_unlock()` when done.
-
-### GPL Symbol Export
-
-Many kernel functions are exported only to GPL-licensed modules (`EXPORT_SYMBOL_GPL()`). This is a licensing mechanism — using these symbols in a non-GPL module is a license violation, and the kernel will refuse to load such a module. KRIES declares `MODULE_LICENSE("GPL")` to comply.
-
-### Kernel Taint
-
-The kernel tracks "taint" flags that indicate its trustworthiness for debugging purposes. Loading a non-GPL module (`TAINT_PROPRIETARY_MODULE`), loading an unsigned module (`TAINT_UNSIGNED_MODULE`), or encountering a kernel oops sets taint flags visible in `/proc/sys/kernel/tainted`. Tainted kernels produce less useful crash reports.
+`/proc/kries` is created world-readable (`0444`). This makes the process table — including which processes are being debugged — visible to any local user. In a hardened deployment this should be `0400` (root-readable only) to prevent information disclosure.
 
 ---
 
-## Security Considerations
+# 6. Limitations
 
-### Privilege Requirements
+## 6.1 Same-Privilege Monitoring
 
-Loading KRIES requires root access (`CAP_SYS_MODULE` capability). This is an appropriate gate — a module with read access to all `task_struct` data and the ability to write to `/proc` must not be loadable by unprivileged users.
+KRIES and any kernel rootkit it might detect operate at the same privilege level. A sufficiently capable rootkit can clear the `PT_PTRACED` flag before KRIES reads it, manipulate the process list to hide entries, or hook the functions KRIES calls to return falsified data. This is a fundamental limitation of in-kernel monitoring: the monitor and the threat share the same trust boundary. Hardware-assisted solutions (hypervisor-based monitoring, remote attestation) address this at the cost of significantly greater complexity.
 
-### Read-Only Design
+## 6.2 Snapshot Detection
 
-KRIES does not modify any kernel data structures. It is a passive observer. This design choice:
+KRIES performs a point-in-time scan at module load. Threats that appear, act, and disappear between scans are not detected. Continuous monitoring would require a persistent kernel thread (`kthread_create()`) or a periodic timer (`timer_list`), introducing CPU overhead and scheduling complexity that are outside the scope of this implementation.
 
-- Minimizes the risk of kernel panics from incorrect pointer manipulation
-- Reduces the attack surface KRIES itself presents
-- Makes the module easier to audit
+## 6.3 False Positives
 
-### Secure Boot Compatibility
+Every process under a legitimate debugger — a developer running GDB, a tracing tool using strace — will trigger the `PTRACE_DETECTED` alert. KRIES logs all cases without filtering. A production deployment would require a whitelist of authorised tracer credentials or process names.
 
-On systems with UEFI Secure Boot enabled, the kernel requires all modules to be signed with a trusted key. KRIES, as a development module, will not be signed by default. Loading it requires either:
+## 6.4 API Stability
 
-1. Disabling Secure Boot in BIOS/UEFI firmware settings
-2. Enrolling a custom Machine Owner Key (MOK) and signing `kries.ko` with it using `mokutil` and `sign-file`
-
-For production deployment, option 2 is strongly preferred.
-
-### /proc Permissions
-
-The `/proc/kries` entry is created with `0444` (world-readable) permissions in the base implementation. In a hardened deployment, this should be restricted to `0400` or `0440` (root-only or root+group) to prevent information disclosure about system state to unprivileged users.
+`task_struct` is an internal kernel data structure. Its layout can change between kernel versions. KRIES must be recompiled against the headers for each target kernel. Fields referenced here (`ptrace`, `comm`, `pid`, `parent`) have been stable across the 5.x and 6.x series but carry no long-term stability guarantee.
 
 ---
 
-## Limitations
+# 7. Conclusion
 
-### Same-Ring Monitoring
+KRIES demonstrates that host-based kernel integrity monitoring is achievable within a few hundred lines of C using stable, well-documented Linux kernel APIs. By operating at ring 0, KRIES reads process state that is authoritative and inaccessible to user-space monitors. The `PT_PTRACED` detection mechanism is reliable, lightweight, and resistant to user-space manipulation. The `/proc` interface provides a zero-dependency reporting channel readable by any existing monitoring pipeline.
 
-KRIES operates at ring 0 (kernel privilege level), the same level as any kernel rootkit it is trying to detect. A sufficiently capable rootkit can:
-
-- Remove itself from the module list before KRIES scans it
-- Clear `PT_PTRACED` flags before KRIES reads them
-- Hook the functions KRIES calls to return falsified data
-
-This is the fundamental limitation of in-kernel monitoring: the monitor and the threat share the same trust boundary. Solutions include:
-
-- Hardware virtualization (running the monitor in a hypervisor layer below the OS)
-- Remote attestation (measuring kernel state from an external trusted system)
-- Kernel self-integrity mechanisms (LKRG, IMA)
-
-### Snapshot-Based Detection
-
-KRIES performs point-in-time scans. A threat that exists between scans will be missed. Continuous monitoring would require a persistent kernel thread, which introduces CPU overhead and scheduling complexity.
-
-### No Enforcement
-
-KRIES logs threats but does not block or terminate them. Adding enforcement (e.g., sending SIGKILL to a detected process) would require careful design to avoid killing legitimate processes and to handle race conditions between detection and termination.
-
-### task_struct Stability
-
-`task_struct` is an internal kernel data structure. Its layout and field names can change between kernel versions. KRIES must be recompiled against the kernel headers for each target kernel version. Fields deprecated or renamed in newer kernels will cause compilation failures.
+The system is deliberately constrained in scope. It does not enforce policy, does not hook kernel functions, and does not attempt to detect kernel-level rootkits that share its privilege level. These constraints make it safe, auditable, and a sound foundation for further research into kernel security instrumentation.
 
 ---
 
-## Future Work
+# References
 
-| Feature | Description | Kernel Mechanism |
-|---|---|---|
-| **Continuous Monitoring** | Run scans on a periodic timer or in a dedicated kernel thread | `kthread_create()`, `timer_list` |
-| **Syscall Monitoring** | Intercept specific system calls | `kprobes`, LSM hooks |
-| **File Integrity** | Monitor critical file modifications | `inotify` (user space) or `fsnotify` (kernel) |
-| **Network Monitoring** | Log suspicious outbound connections | Netfilter hooks |
-| **Alert Persistence** | Store alerts in a ring buffer for `/proc` reads | `kfifo` |
-| **Runtime Configuration** | Allow enabling/disabling rules via `/proc` writes | `write` file operation |
-| **Whitelist Support** | Skip known-good processes/modules | Hash table of approved names |
-| **Kernel Thread Monitoring** | Detect unexpected kernel threads | `for_each_thread()` + kthread flag inspection |
-| **Module Signing Verification** | Warn on unsigned module loads | `module->sig_ok` field |
-
----
-
-## Conclusion
-
-KRIES demonstrates that meaningful runtime integrity monitoring is achievable within the kernel itself using stable, well-documented Linux kernel APIs. By operating at ring 0, KRIES observes system state that is inaccessible or falsifiable from user space, providing a stronger foundation for detecting low-level threats such as ptrace-based debugging and unauthorized kernel modules.
-
-The phased development approach — from a minimal module skeleton through to a structured detection engine with a `/proc` interface — illustrates how kernel security tools are built incrementally, with each layer providing the foundation for the next.
-
-While KRIES is not a production-grade security tool (lacking enforcement, continuous monitoring, and tamper resistance against sophisticated rootkits), it is a complete and functional demonstration of host-based kernel integrity monitoring principles. It serves as both a learning platform and a starting point for more advanced kernel security research.
-
----
-
-## References
-
-1. Corbet, J., Rubini, A., & Kroah-Hartman, G. (2005). *Linux Device Drivers, 3rd Edition*. O'Reilly Media. [https://lwn.net/Kernel/LDD3/](https://lwn.net/Kernel/LDD3/)
+1. Corbet, J., Rubini, A., & Kroah-Hartman, G. (2005). *Linux Device Drivers, 3rd Edition*. O'Reilly Media. https://lwn.net/Kernel/LDD3/
 
 2. Love, R. (2010). *Linux Kernel Development, 3rd Edition*. Addison-Wesley Professional.
 
-3. The Linux Kernel documentation project. *The Linux Kernel API*. [https://www.kernel.org/doc/html/latest/](https://www.kernel.org/doc/html/latest/)
+3. The Linux Kernel documentation project. *The Linux Kernel API*. https://www.kernel.org/doc/html/latest/
 
-4. The Linux Kernel documentation project. *Loadable Kernel Module HOWTO*. [https://www.kernel.org/doc/html/latest/kbuild/modules.html](https://www.kernel.org/doc/html/latest/kbuild/modules.html)
+4. McKenney, P. E. (2007). *What is RCU, Fundamentally?* LWN.net. https://lwn.net/Articles/262464/
 
-5. McKenney, P. E. (2007). *What is RCU, Fundamentally?*. LWN.net. [https://lwn.net/Articles/262464/](https://lwn.net/Articles/262464/)
+5. Kerrisk, M. (2010). *The Linux Programming Interface*. No Starch Press.
 
-6. Kerrisk, M. (2010). *The Linux Programming Interface*. No Starch Press.
+6. Linux Kernel source — `include/linux/sched.h`, `include/linux/ptrace.h`, `include/linux/proc_fs.h`. https://elixir.bootlin.com/linux/v6.8/source
 
-7. Linux Kernel source — `include/linux/sched.h`, `include/linux/module.h`, `include/linux/proc_fs.h`. [https://elixir.bootlin.com/linux/latest/source](https://elixir.bootlin.com/linux/latest/source)
-
-8. LKRG (Linux Kernel Runtime Guard) project. [https://lkrg.org/](https://lkrg.org/)
-
-9. Falco runtime security project. [https://falco.org/](https://falco.org/)
-
-10. National Institute of Standards and Technology. (2022). *Guide to Enterprise Patch Management Planning* (SP 800-40r4). NIST.
-
----
-
-*End of Document*
+7. The Linux kernel contributors. *ptrace(2) man page*. https://man7.org/linux/man-pages/man2/ptrace.2.html
