@@ -171,9 +171,8 @@ static int scan_modules(void)
 
     mutex_lock(&module_mutex);
 
-    list_for_each_entry(mod, THIS_MODULE->list.prev, list) {
-        if (mod == THIS_MODULE)
-            continue;   /* never flag KRIES itself */
+    list_for_each_entry(mod, &THIS_MODULE->list, list) {
+        /* &THIS_MODULE->list as head naturally excludes KRIES itself */
 
         if (rule_is_suspicious_module(mod)) {
             /*

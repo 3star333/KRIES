@@ -88,27 +88,19 @@ void kries_scan_modules(void)
     mutex_lock(&module_mutex);
 
     /*
-     * list_for_each_entry(pos, head, member) walks a list_head list.
+     * list_for_each_entry(pos, head, member) — standard kernel list walk.
      *
-     *   pos    — loop variable: pointer to struct module for each iteration
-     *   head   — the list root. THIS_MODULE->list points into the global
-     *            module list; we use it as our starting anchor.
-     *   member — the name of the list_head field inside struct module
+     * We pass &THIS_MODULE->list as the head. The macro starts iterating
+     * at head->next (the module after KRIES in the list) and stops when
+     * it wraps back around to head (KRIES itself). This means:
      *
-     * The macro resolves each list node back to its enclosing struct module
-     * via container_of(). This is the standard Linux kernel list pattern.
+     *   - KRIES is naturally excluded — no manual `continue` needed.
+     *   - The full list is visited exactly once.
+     *   - This works correctly on all kernels including 6.x, where
+     *     passing a non-head node (e.g. THIS_MODULE->list.prev) as the
+     *     head argument causes undefined wrap-around behaviour.
      */
-    list_for_each_entry(mod, THIS_MODULE->list.prev, list) {
-
-        /*
-         * Skip KRIES itself. Since we are a loaded module, we appear in
-         * our own list. Reporting ourselves would be misleading noise.
-         *
-         * THIS_MODULE is a pointer to our own struct module.
-         * Comparing pointers directly is the correct identity check.
-         */
-        if (mod == THIS_MODULE)
-            continue;
+    list_for_each_entry(mod, &THIS_MODULE->list, list) {
 
         /*
          * Log the module name and its current lifecycle state.

@@ -111,9 +111,8 @@ static int kries_proc_show(struct seq_file *sf, void *unused)
     seq_printf(sf, "------------------------ ---------\n");
 
     mutex_lock(&module_mutex);
-    list_for_each_entry(mod, THIS_MODULE->list.prev, list) {
-        if (mod == THIS_MODULE)
-            continue;   /* skip KRIES itself */
+    list_for_each_entry(mod, &THIS_MODULE->list, list) {
+        /* &THIS_MODULE->list as head naturally excludes KRIES itself */
 
         seq_printf(sf, "%-24s %s%s\n",
                    mod->name,

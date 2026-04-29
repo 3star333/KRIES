@@ -48,7 +48,7 @@ sudo rmmod kries
 
 ```
 KRIES/
-├── kries.c             — Module entry point (init/exit)
+├── kries_main.c        — Module entry point (init/exit)
 ├── kries_log.h         — Logging macros
 ├── kries_process.c/h   — Process enumeration + ptrace detection
 ├── kries_modules.c/h   — Kernel module enumeration

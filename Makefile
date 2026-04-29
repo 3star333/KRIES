@@ -9,8 +9,13 @@
 
 # All object files that make up the kries module.
 # kbuild links these together into a single kries.ko file.
-# Add new .o entries here as each phase introduces a new .c file.
-kries-objs := kries.o kries_process.o kries_modules.o kries_proc.o kries_detect.o
+#
+# IMPORTANT: The main source file is kries_main.c (not kries.c).
+# kries.c cannot be used because kbuild reserves kries.o as the name
+# of the final linked module object — using it as a source object too
+# causes a silent build collision where the composite object overwrites
+# the compiled source object, resulting in "Invalid module format" on insmod.
+kries-objs := kries_main.o kries_process.o kries_modules.o kries_proc.o kries_detect.o
 
 # obj-m tells kbuild: build 'kries' as a loadable module (.ko)
 # Note: the name here must match the kries-objs variable prefix above.
